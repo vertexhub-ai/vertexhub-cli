@@ -3,19 +3,18 @@
 /**
  * VertexHub CLI
  * Orchestrates Antigravity Proxy + Claude Code CLI
- * 
+ *
  * Commands:
  *   vertexhub login    - Login with Google OAuth via Antigravity
  *   vertexhub start    - Start proxy + launch Claude Code
  *   vertexhub status   - Check proxy health and account status
  *   vertexhub accounts - List linked Google accounts
- *   vertexhub config   - Show/edit configuration
  *   vertexhub models   - List available models
  */
 
 import { fileURLToPath } from 'url';
 import { dirname, join, resolve } from 'path';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import { homedir } from 'os';
 
@@ -24,11 +23,58 @@ const __dirname = dirname(__filename);
 
 // --- Config ---
 const PROXY_DIR = resolve(join(__dirname, '..', '..', 'antigravity-proxy'));
-const PROXY_PORT = process.env.VERTEXHUB_PORT || '8090';
-const PROXY_URL = `http://localhost:${PROXY_PORT}`;
+const DEFAULT_PORT = '8090';
+const PROXY_PORT = sanitizePort(process.env.VERTEXHUB_PORT) || DEFAULT_PORT;
+const PROXY_URL = `http://127.0.0.1:${PROXY_PORT}`;
 const CLAUDE_CONFIG_DIR = join(homedir(), '.claude');
 const CLAUDE_SETTINGS_FILE = join(CLAUDE_CONFIG_DIR, 'settings.json');
 const CLAUDE_JSON_FILE = join(homedir(), '.claude.json');
+
+// Track child processes for cleanup
+const childProcesses = [];
+
+// --- Security Helpers ---
+
+/**
+ * Sanitize port value to prevent injection.
+ * Only allows numeric strings in valid port range.
+ */
+function sanitizePort(port) {
+    if (!port) return null;
+    const num = parseInt(port, 10);
+    if (isNaN(num) || num < 1 || num > 65535 || String(num) !== port.trim()) {
+        return null;
+    }
+    return String(num);
+}
+
+/**
+ * Write a file with restricted permissions (owner-only read/write).
+ * Prevents other users from reading sensitive config like auth tokens.
+ */
+function writeFileSecure(filePath, content) {
+    writeFileSync(filePath, content, { mode: 0o600 });
+    // Ensure permissions even if file existed with different perms
+    try { chmodSync(filePath, 0o600); } catch { /* ignore if chmod fails */ }
+}
+
+/**
+ * Validate that PROXY_DIR exists and contains expected files.
+ * Prevents spawning processes from unintended directories.
+ */
+function validateProxyDir() {
+    if (!existsSync(PROXY_DIR)) {
+        err(`Proxy directory not found: ${PROXY_DIR}`);
+        err('Clone the antigravity-proxy repo next to this project.');
+        process.exit(1);
+    }
+    const indexPath = join(PROXY_DIR, 'src', 'index.js');
+    if (!existsSync(indexPath)) {
+        err(`Proxy entry point not found: ${indexPath}`);
+        err('The antigravity-proxy directory appears corrupted.');
+        process.exit(1);
+    }
+}
 
 // --- Colors ---
 const c = {
@@ -50,31 +96,16 @@ function err(msg) { console.error(`${c.red}✗${c.reset} ${msg}`); }
 
 // --- Helpers ---
 
-function getNvmNodePath() {
-    const nvmDir = join(homedir(), '.nvm');
-    try {
-        const defaultAlias = readFileSync(join(nvmDir, 'alias', 'default'), 'utf-8').trim();
-        const version = defaultAlias.startsWith('v') ? defaultAlias : `v${defaultAlias}`;
-
-        // Find matching version directory
-        const versionsDir = join(nvmDir, 'versions', 'node');
-        if (existsSync(versionsDir)) {
-            const dirs = readdirSync(versionsDir).filter(d => d.startsWith(version) || d.startsWith(`v${version}`));
-            if (dirs.length > 0) {
-                const nodeDir = join(versionsDir, dirs[dirs.length - 1], 'bin');
-                if (existsSync(join(nodeDir, 'node'))) return nodeDir;
-            }
-        }
-    } catch { }
-    return null;
-}
-
+/**
+ * Find node binary. Tries system PATH first, then NVM.
+ * Returns absolute path or 'node' if available on PATH.
+ */
 function getNodeBin() {
     // Try system node first
     try {
-        execSync('which node', { stdio: 'pipe' });
-        return 'node';
-    } catch { }
+        const result = execSync('which node', { stdio: 'pipe', encoding: 'utf-8', timeout: 5000 }).trim();
+        if (result) return result;
+    } catch { /* not on PATH */ }
 
     // Try NVM
     const nvmDir = join(homedir(), '.nvm');
@@ -82,13 +113,27 @@ function getNodeBin() {
         try {
             const result = execSync(
                 `bash -c 'export NVM_DIR="$HOME/.nvm" && source "$NVM_DIR/nvm.sh" && which node'`,
-                { stdio: 'pipe', encoding: 'utf-8' }
+                { stdio: 'pipe', encoding: 'utf-8', timeout: 10000 }
             ).trim();
-            if (result) return result;
-        } catch { }
+            if (result && existsSync(result)) return result;
+        } catch { /* NVM not available */ }
     }
 
     return null;
+}
+
+/**
+ * Resolve and validate node binary.
+ * Exits with error if node is not found.
+ */
+function requireNodeBin() {
+    const nodeBin = getNodeBin();
+    if (!nodeBin) {
+        err('Node.js not found. Install Node.js 18+ first.');
+        err('  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash');
+        process.exit(1);
+    }
+    return nodeBin;
 }
 
 async function isProxyRunning() {
@@ -103,8 +148,11 @@ async function isProxyRunning() {
 async function getProxyStatus() {
     try {
         const [health, limits] = await Promise.all([
-            fetch(`${PROXY_URL}/health`, { signal: AbortSignal.timeout(3000) }).then(r => r.json()),
-            fetch(`${PROXY_URL}/account-limits`, { signal: AbortSignal.timeout(3000) }).then(r => r.json()).catch(() => null),
+            fetch(`${PROXY_URL}/health`, { signal: AbortSignal.timeout(3000) })
+                .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
+            fetch(`${PROXY_URL}/account-limits`, { signal: AbortSignal.timeout(3000) })
+                .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+                .catch(() => null),
         ]);
         return { health, limits };
     } catch {
@@ -115,25 +163,37 @@ async function getProxyStatus() {
 async function getModels() {
     try {
         const response = await fetch(`${PROXY_URL}/v1/models`, { signal: AbortSignal.timeout(3000) });
-        return response.json();
+        if (!response.ok) {
+            warn(`Models endpoint returned HTTP ${response.status}`);
+            return null;
+        }
+        return await response.json();
     } catch {
         return null;
     }
 }
 
 function configureClaudeSettings() {
-    mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
+    mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true, mode: 0o700 });
 
     let settings = {};
     if (existsSync(CLAUDE_SETTINGS_FILE)) {
         try {
             settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_FILE, 'utf-8'));
-        } catch { }
+        } catch (e) {
+            warn(`Could not parse existing ${CLAUDE_SETTINGS_FILE}: ${e.message}`);
+            warn('Creating new settings file.');
+        }
+    }
+
+    // Ensure settings is a plain object (defense against prototype pollution)
+    if (typeof settings !== 'object' || settings === null || Array.isArray(settings)) {
+        settings = {};
     }
 
     settings.env = {
-        ...settings.env,
-        ANTHROPIC_AUTH_TOKEN: 'test',
+        ...(settings.env || {}),
+        ANTHROPIC_AUTH_TOKEN: 'vertexhub-proxy',
         ANTHROPIC_BASE_URL: PROXY_URL,
         ANTHROPIC_MODEL: 'claude-opus-4-6-thinking',
         ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-6-thinking',
@@ -142,7 +202,7 @@ function configureClaudeSettings() {
         CLAUDE_CODE_SUBAGENT_MODEL: 'claude-sonnet-4-5-thinking',
     };
 
-    writeFileSync(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2));
+    writeFileSecure(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2));
     ok(`Claude Code settings configured → ${CLAUDE_SETTINGS_FILE}`);
 
     // Ensure hasCompletedOnboarding is set
@@ -150,25 +210,29 @@ function configureClaudeSettings() {
     if (existsSync(CLAUDE_JSON_FILE)) {
         try {
             claudeJson = JSON.parse(readFileSync(CLAUDE_JSON_FILE, 'utf-8'));
-        } catch { }
+        } catch (e) {
+            warn(`Could not parse existing ${CLAUDE_JSON_FILE}: ${e.message}`);
+        }
     }
+
+    if (typeof claudeJson !== 'object' || claudeJson === null || Array.isArray(claudeJson)) {
+        claudeJson = {};
+    }
+
     if (!claudeJson.hasCompletedOnboarding) {
         claudeJson.hasCompletedOnboarding = true;
-        writeFileSync(CLAUDE_JSON_FILE, JSON.stringify(claudeJson, null, 2));
+        writeFileSecure(CLAUDE_JSON_FILE, JSON.stringify(claudeJson, null, 2));
         ok('Claude Code onboarding bypassed');
     }
 }
 
 function startProxy() {
-    const nodeBin = getNodeBin();
-    if (!nodeBin) {
-        err('Node.js not found. Install Node.js 18+ first.');
-        process.exit(1);
-    }
+    validateProxyDir();
+    const nodeBin = requireNodeBin();
 
     log(`Starting Antigravity proxy on port ${PROXY_PORT}...`);
 
-    const env = { ...process.env, PORT: PROXY_PORT };
+    const env = { ...process.env, PORT: PROXY_PORT, HOST: '127.0.0.1' };
     const proxyProcess = spawn(nodeBin, [join(PROXY_DIR, 'src', 'index.js')], {
         env,
         cwd: PROXY_DIR,
@@ -176,6 +240,7 @@ function startProxy() {
         detached: true,
     });
 
+    childProcesses.push(proxyProcess);
     proxyProcess.unref();
 
     proxyProcess.stdout.on('data', (data) => {
@@ -189,11 +254,34 @@ function startProxy() {
         const line = data.toString().trim();
         if (line.includes('EADDRINUSE')) {
             warn(`Port ${PROXY_PORT} already in use — proxy may already be running`);
+        } else if (line.length > 0) {
+            // Log unexpected stderr for debugging
+            log(`[proxy:stderr] ${line.substring(0, 200)}`);
         }
+    });
+
+    proxyProcess.on('error', (error) => {
+        err(`Failed to start proxy: ${error.message}`);
     });
 
     return proxyProcess;
 }
+
+// --- Cleanup ---
+
+function cleanup() {
+    for (const child of childProcesses) {
+        try {
+            if (child.pid && !child.killed) {
+                process.kill(-child.pid, 'SIGTERM');
+            }
+        } catch { /* process may have already exited */ }
+    }
+}
+
+process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+process.on('SIGINT', () => { cleanup(); process.exit(0); });
+process.on('exit', cleanup);
 
 // --- Commands ---
 
@@ -203,6 +291,8 @@ ${c.bold}${c.cyan}╔═══════════════════�
 ║       VertexHub — Google Login       ║
 ╚══════════════════════════════════════╝${c.reset}
 `);
+
+    validateProxyDir();
 
     // Check if proxy is running
     if (!(await isProxyRunning())) {
@@ -221,19 +311,35 @@ ${c.bold}${c.cyan}╔═══════════════════�
     }
 
     // Launch accounts manager
-    const nodeBin = getNodeBin();
-    const accountsProcess = spawn(nodeBin, [join(PROXY_DIR, 'src', 'cli', 'accounts.js'), 'add'], {
+    const nodeBin = requireNodeBin();
+    const accountsScript = join(PROXY_DIR, 'src', 'cli', 'accounts.js');
+    if (!existsSync(accountsScript)) {
+        err(`Accounts script not found: ${accountsScript}`);
+        process.exit(1);
+    }
+
+    const accountsProcess = spawn(nodeBin, [accountsScript, 'add'], {
         env: { ...process.env, PORT: PROXY_PORT },
         cwd: PROXY_DIR,
         stdio: 'inherit',
     });
 
-    accountsProcess.on('exit', (code) => {
-        if (code === 0) {
-            ok('Google account linked successfully!');
-            configureClaudeSettings();
-            log(`Run ${c.bold}vertexhub start${c.reset} to begin coding with Claude Code.`);
-        }
+    await new Promise((resolve) => {
+        accountsProcess.on('exit', (code) => {
+            if (code === 0) {
+                ok('Google account linked successfully!');
+                configureClaudeSettings();
+                log(`Run ${c.bold}vertexhub start${c.reset} to begin coding with Claude Code.`);
+            } else {
+                err(`Account linking failed (exit code: ${code})`);
+            }
+            resolve();
+        });
+
+        accountsProcess.on('error', (error) => {
+            err(`Failed to launch accounts manager: ${error.message}`);
+            resolve();
+        });
     });
 }
 
@@ -243,6 +349,8 @@ ${c.bold}${c.magenta}╔══════════════════�
 ║     VertexHub — Starting Session     ║
 ╚══════════════════════════════════════╝${c.reset}
 `);
+
+    validateProxyDir();
 
     // 1. Configure Claude Code settings
     configureClaudeSettings();
@@ -264,7 +372,8 @@ ${c.bold}${c.magenta}╔══════════════════�
         }
         console.log();
         if (!started) {
-            err('Proxy failed to start. Check logs.');
+            err('Proxy failed to start within 15 seconds.');
+            err(`Check: ${c.dim}VERTEXHUB_PORT=${PROXY_PORT} node ${PROXY_DIR}/src/index.js${c.reset}`);
             process.exit(1);
         }
         ok(`Proxy started at ${PROXY_URL}`);
@@ -276,21 +385,27 @@ ${c.bold}${c.magenta}╔══════════════════�
         env: {
             ...process.env,
             ANTHROPIC_BASE_URL: PROXY_URL,
-            ANTHROPIC_AUTH_TOKEN: 'test',
+            ANTHROPIC_AUTH_TOKEN: 'vertexhub-proxy',
         },
         stdio: 'inherit',
     });
 
-    claudeProcess.on('error', (error) => {
-        if (error.code === 'ENOENT') {
-            err('Claude Code CLI not found. Install it first:');
-            console.log(`  ${c.dim}npm install -g @anthropic-ai/claude-code${c.reset}`);
-            console.log(`  ${c.dim}or: curl -fsSL https://claude.ai/install.sh | sh${c.reset}`);
-        }
-    });
+    await new Promise((resolve) => {
+        claudeProcess.on('error', (error) => {
+            if (error.code === 'ENOENT') {
+                err('Claude Code CLI not found. Install it first:');
+                console.log(`  ${c.dim}npm install -g @anthropic-ai/claude-code${c.reset}`);
+                console.log(`  ${c.dim}or: curl -fsSL https://claude.ai/install.sh | sh${c.reset}`);
+            } else {
+                err(`Failed to launch Claude Code: ${error.message}`);
+            }
+            resolve();
+        });
 
-    claudeProcess.on('exit', (code) => {
-        log(`Session ended (code: ${code})`);
+        claudeProcess.on('exit', (code) => {
+            log(`Session ended (code: ${code})`);
+            resolve();
+        });
     });
 }
 
@@ -315,10 +430,17 @@ ${c.bold}${c.blue}╔═══════════════════�
             const accounts = Array.isArray(status.limits) ? status.limits : [status.limits];
             console.log(`  Accounts: ${accounts.length}`);
             for (const acc of accounts) {
-                const name = acc.email || acc.id || 'unknown';
+                const name = String(acc.email || acc.id || 'unknown').substring(0, 50);
                 console.log(`    → ${name}: ${acc.status || 'active'}`);
             }
         }
+    }
+
+    // Proxy dir check
+    if (existsSync(PROXY_DIR)) {
+        console.log(`  Proxy Dir: ${c.green}● Found${c.reset} (${PROXY_DIR})`);
+    } else {
+        console.log(`  Proxy Dir: ${c.red}● Missing${c.reset} (${PROXY_DIR})`);
     }
 
     // Claude Code config
@@ -332,7 +454,7 @@ ${c.bold}${c.blue}╔═══════════════════�
             console.log(`    Base URL: ${baseUrl || 'not set'}`);
             console.log(`    Model: ${model || 'not set'}`);
         } catch {
-            console.log(`  Claude Config: ${c.yellow}● Invalid${c.reset}`);
+            console.log(`  Claude Config: ${c.yellow}● Invalid JSON${c.reset}`);
         }
     } else {
         console.log(`  Claude Config: ${c.red}● Not configured${c.reset}`);
@@ -341,11 +463,15 @@ ${c.bold}${c.blue}╔═══════════════════�
 
     // Claude Code installed?
     try {
-        execSync('which claude', { stdio: 'pipe' });
+        execSync('which claude', { stdio: 'pipe', timeout: 5000 });
         console.log(`  Claude Code: ${c.green}● Installed${c.reset}`);
     } catch {
         console.log(`  Claude Code: ${c.red}● Not found${c.reset}`);
     }
+
+    // Node.js
+    const nodeBin = getNodeBin();
+    console.log(`  Node.js: ${nodeBin ? `${c.green}● ${nodeBin}${c.reset}` : `${c.red}● Not found${c.reset}`}`);
 
     console.log();
 }
@@ -356,11 +482,31 @@ async function cmdAccounts() {
         process.exit(1);
     }
 
-    const nodeBin = getNodeBin();
-    spawn(nodeBin, [join(PROXY_DIR, 'src', 'cli', 'accounts.js'), ...(process.argv.slice(3))], {
+    validateProxyDir();
+    const nodeBin = requireNodeBin();
+    const accountsScript = join(PROXY_DIR, 'src', 'cli', 'accounts.js');
+
+    if (!existsSync(accountsScript)) {
+        err(`Accounts script not found: ${accountsScript}`);
+        process.exit(1);
+    }
+
+    // Only pass known safe subcommands
+    const allowedSubcommands = ['add', 'list', 'remove', 'verify'];
+    const subArgs = process.argv.slice(3).filter(arg => allowedSubcommands.includes(arg));
+
+    const accountsProcess = spawn(nodeBin, [accountsScript, ...subArgs], {
         env: { ...process.env, PORT: PROXY_PORT },
         cwd: PROXY_DIR,
         stdio: 'inherit',
+    });
+
+    await new Promise((resolve) => {
+        accountsProcess.on('exit', resolve);
+        accountsProcess.on('error', (error) => {
+            err(`Failed to launch accounts manager: ${error.message}`);
+            resolve();
+        });
     });
 }
 
@@ -371,14 +517,16 @@ async function cmdModels() {
     }
 
     const models = await getModels();
-    if (!models?.data) {
+    if (!models?.data || !Array.isArray(models.data)) {
         err('Could not fetch models from proxy.');
         process.exit(1);
     }
 
     console.log(`\n${c.bold}Available Models:${c.reset}\n`);
     for (const model of models.data) {
-        console.log(`  ${c.cyan}${model.id}${c.reset}`);
+        // Sanitize model id for display (prevent terminal escape injection)
+        const id = String(model.id || '').replace(/[\x00-\x1f\x7f]/g, '');
+        console.log(`  ${c.cyan}${id}${c.reset}`);
     }
     console.log(`\n  Total: ${models.data.length} models\n`);
 }
@@ -399,7 +547,7 @@ ${c.bold}Commands:${c.reset}
   ${c.cyan}help${c.reset}       Show this help
 
 ${c.bold}Environment:${c.reset}
-  VERTEXHUB_PORT   Proxy port (default: 8090)
+  VERTEXHUB_PORT   Proxy port (default: ${DEFAULT_PORT})
 
 ${c.bold}First time?${c.reset}
   1. ${c.dim}vertexhub login${c.reset}     # Link your Google account
