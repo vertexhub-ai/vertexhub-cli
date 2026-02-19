@@ -89,6 +89,14 @@ const c = {
     cyan: '\x1b[36m',
 };
 
+/**
+ * Strip control characters from a string to prevent terminal escape injection.
+ * Preserves printable ASCII + extended Unicode but removes ESC, BEL, etc.
+ */
+function sanitizeForTerminal(str) {
+    return String(str).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+}
+
 function log(msg) { console.log(`${c.cyan}[VertexHub]${c.reset} ${msg}`); }
 function ok(msg) { console.log(`${c.green}✓${c.reset} ${msg}`); }
 function warn(msg) { console.log(`${c.yellow}⚠${c.reset} ${msg}`); }
@@ -568,7 +576,7 @@ switch (command) {
     case '--help':
     case '-h': cmdHelp(); break;
     default:
-        err(`Unknown command: ${command}`);
+        err(`Unknown command: ${sanitizeForTerminal(command)}`);
         cmdHelp();
         process.exit(1);
 }
