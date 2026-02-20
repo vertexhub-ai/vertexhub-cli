@@ -293,7 +293,32 @@ process.on('exit', cleanup);
 
 // --- Commands ---
 
+/**
+ * Detect if we're running on a remote/headless server (SSH session, no display).
+ */
+function isRemoteSession() {
+    return !!(process.env.SSH_CONNECTION || process.env.SSH_CLIENT || process.env.SSH_TTY || !process.env.DISPLAY);
+}
+
+/**
+ * Stop the proxy server if it's running.
+ * Required before managing accounts (accounts.js enforces this).
+ */
+async function stopProxy() {
+    // Kill processes on both default port (8080) and configured port
+    const portsToFree = [...new Set(['8080', PROXY_PORT])];
+    for (const port of portsToFree) {
+        try {
+            execSync(`fuser -k ${port}/tcp 2>/dev/null`, { stdio: 'pipe', timeout: 5000 });
+        } catch { /* port may already be free */ }
+    }
+    // Wait for ports to fully release
+    await new Promise(r => setTimeout(r, 2000));
+}
+
 async function cmdLogin() {
+    const isRemote = isRemoteSession();
+
     console.log(`
 ${c.bold}${c.cyan}╔══════════════════════════════════════╗
 ║       VertexHub — Google Login       ║
@@ -302,23 +327,43 @@ ${c.bold}${c.cyan}╔═══════════════════�
 
     validateProxyDir();
 
-    // Check if proxy is running
-    if (!(await isProxyRunning())) {
-        log('Proxy not running, starting it first...');
-        startProxy();
-        // Wait for proxy to start
-        for (let i = 0; i < 10; i++) {
-            await new Promise(r => setTimeout(r, 1000));
-            if (await isProxyRunning()) break;
+    // Accounts manager requires the proxy to be STOPPED
+    if (await isProxyRunning()) {
+        log('Stopping proxy (required to manage accounts)...');
+        await stopProxy();
+        if (await isProxyRunning()) {
+            err('Could not stop proxy. Stop it manually (Ctrl+C) and try again.');
+            process.exit(1);
         }
+        ok('Proxy stopped.');
     }
 
-    if (!(await isProxyRunning())) {
-        err('Could not start proxy. Start it manually with: vertexhub start');
-        process.exit(1);
+    // Show instructions for remote servers
+    if (isRemote) {
+        console.log(`${c.bold}${c.yellow}  ⚠ Remote/headless server detected${c.reset}`);
+        console.log(`
+  The OAuth login will generate a Google URL.
+  After signing in, Google redirects to ${c.bold}localhost${c.reset} which won't
+  work from your local browser because the server is remote.
+
+  ${c.bold}How to complete the login:${c.reset}
+
+  ${c.cyan}Option A — Copy the redirect URL${c.reset}
+    1. Open the Google auth URL in your browser
+    2. Sign in and click "Allow"
+    3. You'll see "${c.red}localhost refused to connect${c.reset}" — ${c.green}this is normal!${c.reset}
+    4. Copy the ${c.bold}FULL URL${c.reset} from your browser's address bar
+       (it looks like: http://localhost:XXXXX/oauth-callback?code=4/0A...)
+    5. Paste it when prompted below
+
+  ${c.cyan}Option B — SSH tunnel (recommended for reliability)${c.reset}
+    On your local machine, open a NEW terminal and run:
+    ${c.dim}ssh -L 51121:localhost:51121 ${process.env.USER || 'user'}@${process.env.HOSTNAME || 'your-server'}${c.reset}
+    Then open the Google URL — the redirect will work automatically.
+`);
     }
 
-    // Launch accounts manager
+    // Launch accounts manager in no-browser mode on remote servers
     const nodeBin = requireNodeBin();
     const accountsScript = join(PROXY_DIR, 'src', 'cli', 'accounts.js');
     if (!existsSync(accountsScript)) {
@@ -326,7 +371,10 @@ ${c.bold}${c.cyan}╔═══════════════════�
         process.exit(1);
     }
 
-    const accountsProcess = spawn(nodeBin, [accountsScript, 'add'], {
+    const args = [accountsScript, 'add'];
+    if (isRemote) args.push('--no-browser');
+
+    const accountsProcess = spawn(nodeBin, args, {
         env: { ...process.env, PORT: PROXY_PORT },
         cwd: PROXY_DIR,
         stdio: 'inherit',
@@ -337,7 +385,11 @@ ${c.bold}${c.cyan}╔═══════════════════�
             if (code === 0) {
                 ok('Google account linked successfully!');
                 configureClaudeSettings();
-                log(`Run ${c.bold}vertexhub start${c.reset} to begin coding with Claude Code.`);
+                console.log(`
+${c.green}✓ Login complete!${c.reset} Next steps:
+  ${c.dim}vertexhub start${c.reset}     Start proxy + Claude Code
+  ${c.dim}vertexhub status${c.reset}    Verify everything is working
+`);
             } else {
                 err(`Account linking failed (exit code: ${code})`);
             }
